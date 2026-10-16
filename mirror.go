@@ -202,15 +202,59 @@ func (rrt *registryRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 		return nil, err
 	}
 
-	// Google Artifact Registry sends a "location: /artifacts-downloads/..." URL
-	// to download blobs. We don't want these routed to the proxy itself.
-	if locHdr := resp.Header.Get("location"); req.Method == http.MethodGet &&
-		resp.StatusCode == http.StatusFound && strings.HasPrefix(locHdr, "/") {
-		resp.Header.Set("location", req.URL.Scheme+"://"+req.URL.Host+locHdr)
+	if req.Method == http.MethodGet || req.Method == http.MethodHead {
+		if resp, err = followRedirects(req, resp); err != nil {
+			log.Printf("following redirect failed with error: %+v", err)
+			return nil, err
+		}
 	}
 
 	updateTokenEndpoint(resp, origHost)
 	return resp, nil
+}
+
+const maxRedirects = 10
+
+// followRedirects fetches the target of each redirect in resp on behalf of the
+// client and returns the final response. Credentials are only sent to the
+// original registry host, as the storage URLs carry their own signature.
+func followRedirects(req *http.Request, resp *http.Response) (*http.Response, error) {
+	for i := 0; isRedirect(resp.StatusCode); i++ {
+		loc, err := resp.Location()
+		if err != nil {
+			return resp, nil
+		}
+		_ = resp.Body.Close()
+		if i == maxRedirects {
+			return nil, fmt.Errorf("stopped after %d redirects", maxRedirects)
+		}
+
+		next, err := http.NewRequestWithContext(req.Context(), req.Method, loc.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		next.Header = req.Header.Clone()
+		if loc.Host != req.URL.Host {
+			next.Header.Del("Authorization")
+			next.Header.Del("Cookie")
+		}
+
+		log.Printf("following redirect (status=%d) to host=%s", resp.StatusCode, loc.Host)
+		if resp, err = http.DefaultTransport.RoundTrip(next); err != nil {
+			return nil, err
+		}
+		log.Printf("redirect completed (status=%d) host=%s", resp.StatusCode, loc.Host)
+	}
+	return resp, nil
+}
+
+func isRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
 }
 
 // updateTokenEndpoint modifies the response header like:
