@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"testing"
 )
 
@@ -66,5 +68,71 @@ func TestRoundTripFollowsBlobRedirect(t *testing.T) {
 				t.Errorf("body = %q, want %q", body, blob)
 			}
 		})
+	}
+}
+
+func TestRewriteRegistryV2URL(t *testing.T) {
+	rewrite := rewriteRegistryV2URL(registryConfig{registryHost: "ghcr.io", repositoryPrefix: "prefix"})
+
+	for path, want := range map[string]string{
+		"/v2/":                    "https://ghcr.io/v2/",
+		"/v2/img/manifests/1.0":   "https://ghcr.io/v2/prefix/img/manifests/1.0",
+		"/v2/a/b/blobs/sha256:ab": "https://ghcr.io/v2/prefix/a/b/blobs/sha256:ab",
+	} {
+		in := httptest.NewRequest(http.MethodGet, "http://mirror.example.com"+path, nil)
+		pr := &httputil.ProxyRequest{In: in, Out: in.Clone(in.Context())}
+		rewrite(pr)
+
+		if got := pr.Out.URL.String(); got != want {
+			t.Errorf("%s: url = %q, want %q", path, got, want)
+		}
+		if pr.Out.Host != "ghcr.io" {
+			t.Errorf("%s: host = %q, want %q", path, pr.Out.Host, "ghcr.io")
+		}
+		if in.URL.Path != path {
+			t.Errorf("%s: inbound request was modified to %q", path, in.URL.Path)
+		}
+	}
+}
+
+func TestTokenProxyHandler(t *testing.T) {
+	var got *http.Request
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r
+		_, _ = io.WriteString(w, `{"token":"t"}`)
+	}))
+	defer tokenServer.Close()
+
+	endpoint, err := url.Parse(tokenServer.URL + "/token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := tokenProxyHandler(endpoint, "prefix")
+
+	for query, wantScope := range map[string]string{
+		"scope=repository:img:pull&service=ghcr.io": "repository:prefix/img:pull",
+		"service=ghcr.io": "",
+	} {
+		got = nil
+		req := httptest.NewRequest(http.MethodGet, "http://mirror.example.com/_token?"+query, nil)
+		req.Header.Set("X-Forwarded-For", "203.0.113.7")
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+
+		if rec.Code != http.StatusOK || got == nil {
+			t.Fatalf("%s: status = %d, token server reached = %t", query, rec.Code, got != nil)
+		}
+		if got.URL.Path != "/token" {
+			t.Errorf("%s: path = %q, want %q", query, got.URL.Path, "/token")
+		}
+		if s := got.URL.Query().Get("scope"); s != wantScope {
+			t.Errorf("%s: scope = %q, want %q", query, s, wantScope)
+		}
+		if got.Host != endpoint.Host {
+			t.Errorf("%s: host = %q, want %q", query, got.Host, endpoint.Host)
+		}
+		if xff := got.Header.Get("X-Forwarded-For"); xff != "" {
+			t.Errorf("%s: token server received X-Forwarded-For %q", query, xff)
+		}
 	}
 }

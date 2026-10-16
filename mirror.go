@@ -66,7 +66,11 @@ func main() {
 		mux.Handle("/", browserRedirectHandler(reg))
 	}
 	if tokenEndpoint != "" {
-		mux.Handle("/_token", tokenProxyHandler(tokenEndpoint, repositoryPrefix))
+		tokenURL, err := url.Parse(tokenEndpoint)
+		if err != nil {
+			log.Fatalf("token endpoint %q is not a valid url: %+v", tokenEndpoint, err)
+		}
+		mux.Handle("/_token", tokenProxyHandler(tokenURL, repositoryPrefix))
 	}
 
 	handler := captureHostHeader(mux)
@@ -118,26 +122,21 @@ func captureHostHeader(next http.Handler) http.Handler {
 
 // tokenProxyHandler proxies the token requests to the specified token service.
 // It adjusts the ?scope= parameter in the query from "repository:foo:..." to
-// "repository:repoPrefix/foo:.." and reverse proxies the query to the specified
+// "repository:repoPrefix/foo:..." and reverse proxies the query to the specified
 // tokenEndpoint.
-func tokenProxyHandler(tokenEndpoint, repoPrefix string) http.HandlerFunc {
+func tokenProxyHandler(tokenEndpoint *url.URL, repoPrefix string) http.HandlerFunc {
 	return (&httputil.ReverseProxy{
 		FlushInterval: -1,
-		Director: func(r *http.Request) {
-			orig := r.URL.String()
-
-			q := r.URL.Query()
-			scope := q.Get("scope")
-			if scope == "" {
-				return
+		Rewrite: func(r *httputil.ProxyRequest) {
+			q := r.In.URL.Query()
+			if scope := q.Get("scope"); scope != "" {
+				q.Set("scope", strings.Replace(scope, "repository:", fmt.Sprintf("repository:%s/", repoPrefix), 1))
 			}
-			newScope := strings.Replace(scope, "repository:", fmt.Sprintf("repository:%s/", repoPrefix), 1)
-			q.Set("scope", newScope)
-			u, _ := url.Parse(tokenEndpoint)
+			u := *tokenEndpoint
 			u.RawQuery = q.Encode()
-			r.URL = u
-			log.Printf("tokenProxyHandler: rewrote url:%s into:%s", orig, r.URL)
-			r.Host = u.Host
+			r.Out.URL = &u
+			r.Out.Host = ""
+			log.Printf("tokenProxyHandler: rewrote url:%s into:%s", r.In.URL, r.Out.URL)
 		},
 	}).ServeHTTP
 }
@@ -157,7 +156,7 @@ func browserRedirectHandler(cfg registryConfig) http.HandlerFunc {
 func registryAPIProxy(cfg registryConfig, auth authenticator) http.HandlerFunc {
 	return (&httputil.ReverseProxy{
 		FlushInterval: -1,
-		Director:      rewriteRegistryV2URL(cfg),
+		Rewrite:       rewriteRegistryV2URL(cfg),
 		Transport: &registryRoundTripper{
 			auth: auth,
 		},
@@ -166,16 +165,15 @@ func registryAPIProxy(cfg registryConfig, auth authenticator) http.HandlerFunc {
 
 // rewriteRegistryV2URL rewrites request.URL like /v2/* that come into the server
 // into https://[GCR_HOST]/v2/[PROJECT_ID]/*. It leaves /v2/ as is.
-func rewriteRegistryV2URL(c registryConfig) func(*http.Request) {
-	return func(req *http.Request) {
-		u := req.URL.String()
-		req.Host = c.registryHost
-		req.URL.Scheme = "https"
-		req.URL.Host = c.registryHost
-		if req.URL.Path != "/v2/" {
-			req.URL.Path = re.ReplaceAllString(req.URL.Path, fmt.Sprintf("/v2/%s/", c.repositoryPrefix))
+func rewriteRegistryV2URL(c registryConfig) func(*httputil.ProxyRequest) {
+	return func(r *httputil.ProxyRequest) {
+		r.Out.Host = c.registryHost
+		r.Out.URL.Scheme = "https"
+		r.Out.URL.Host = c.registryHost
+		if r.Out.URL.Path != "/v2/" {
+			r.Out.URL.Path = re.ReplaceAllString(r.Out.URL.Path, fmt.Sprintf("/v2/%s/", c.repositoryPrefix))
 		}
-		log.Printf("rewrote url: %s into %s", u, req.URL)
+		log.Printf("rewrote url: %s into %s", r.In.URL, r.Out.URL)
 	}
 }
 
