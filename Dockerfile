@@ -1,4 +1,4 @@
-FROM golang:1.19-alpine
+FROM golang:1.27-alpine
 WORKDIR $GOPATH/src/go.sadegh.io/mirror
 COPY . .
 RUN CGO_ENABLED=0 go install

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -75,7 +76,7 @@ func main() {
 	} else {
 		err = http.ListenAndServe(addr, handler)
 	}
-	if err != http.ErrServerClosed {
+	if !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("listen error: %+v", err)
 	}
 
